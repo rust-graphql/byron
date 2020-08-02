@@ -117,6 +117,8 @@ impl<T: Canonicalizable + Queriable + DeserializeOwned> Handle<T> {
             }
         }
 
+        body.query = format!("query {{ {} }}", body.query);
+
         let resp = self
             .core
             .http
@@ -141,7 +143,7 @@ impl<T: Canonicalizable + Queriable + DeserializeOwned> Handle<T> {
             None => return Err(GraphQlError(root).into()),
         };
 
-        for link in self.path[1..].iter().chain(path.iter()) {
+        for link in self.path.iter().chain(path.iter()) {
             value = match value.get_mut(&link.name) {
                 Some(v) => v,
                 None => return Err(GraphQlError(root).into()),
@@ -202,11 +204,7 @@ impl<T: Queriable + Default> Handle<T> {
 
         Ok(Self {
             core,
-            path: vec![Link {
-                name: "query".into(),
-                kind: Some(T::TYPE.into()),
-                args: vec![],
-            }],
+            path: vec![],
             item: T::default(),
         })
     }
@@ -226,18 +224,11 @@ mod tests {
         fn canonicalize(&self, _: Vec<Link>) -> Vec<Link> {
             let val = to_string(self.id()).unwrap();
 
-            vec![
-                Link {
-                    name: "query".into(),
-                    kind: None,
-                    args: vec![],
-                },
-                Link {
-                    name: "node".into(),
-                    kind: Some(T::TYPE.into()),
-                    args: vec![("id".into(), val)],
-                },
-            ]
+            vec![Link {
+                name: "node".into(),
+                kind: Some(T::TYPE.into()),
+                args: vec![("id".into(), val)],
+            }]
         }
     }
 
