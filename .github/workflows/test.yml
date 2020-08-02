@@ -1,0 +1,35 @@
+
+on: [push, pull_request]
+name: test
+jobs:
+  test:
+    name: ${{ matrix.os }} ${{ matrix.toolchain }} (${{ matrix.profile.name }})
+    runs-on: ${{ matrix.os }}-latest
+    env:
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@v2
+      - uses: actions-rs/toolchain@v1
+        with:
+          toolchain: ${{ matrix.toolchain }}
+          override: true
+      - uses: actions-rs/cargo@v1
+        with:
+          command: test
+          args: ${{ matrix.profile.flag }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - windows
+          - ubuntu
+          - macos
+        toolchain:
+          - nightly
+          - beta
+          - stable
+          - 1.40.0
+        profile:
+          - name: debug
+          - name: release
+            flag: --release
