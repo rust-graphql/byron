@@ -1,321 +1,155 @@
-// SPDX-License-Identifier: Apache-2.0
-
-#![deny(clippy::all)]
-
-use std::sync::Arc;
-
-use reqwest::header::{HeaderMap, HeaderName, USER_AGENT};
-use reqwest::{Client, StatusCode, Url};
-use serde::{de::DeserializeOwned, Serialize};
-use serde_json::{value::from_value, Value};
-
-pub trait Canonicalizable {
-    fn canonicalize(&self, path: Vec<Link>) -> Vec<Link> {
-        path
-    }
-}
-
-impl<T: Canonicalizable> Canonicalizable for Vec<T> {}
-impl<T: Canonicalizable> Canonicalizable for Option<T> {
-    fn canonicalize(&self, path: Vec<Link>) -> Vec<Link> {
-        match self {
-            Some(t) => t.canonicalize(path),
-            None => path,
-        }
-    }
-}
-
-pub trait Queriable {
-    const QUERY: &'static [&'static str];
-    const TYPE: &'static str;
-}
-
-impl<T: Queriable> Queriable for Vec<T> {
-    const QUERY: &'static [&'static str] = T::QUERY;
-    const TYPE: &'static str = T::TYPE;
-}
-
-impl<T: Queriable> Queriable for Option<T> {
-    const QUERY: &'static [&'static str] = T::QUERY;
-    const TYPE: &'static str = T::TYPE;
-}
-
-#[derive(Debug)]
-pub struct HttpError(StatusCode);
-impl std::error::Error for HttpError {}
-impl std::fmt::Display for HttpError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.0)
-    }
-}
-
-#[derive(Debug)]
-pub struct GraphQlError(Value);
-impl std::error::Error for GraphQlError {}
-impl std::fmt::Display for GraphQlError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.0)
-    }
-}
-
-#[derive(Clone, Debug)]
-pub struct Link {
-    name: String,
-    kind: Option<String>,
-    args: Vec<(String, String)>,
-}
-
-#[derive(Clone, Debug)]
-struct Core {
-    http: Client,
-    head: HeaderMap,
-    base: Url,
-}
-
-#[derive(Serialize)]
-struct Body {
-    query: String,
-}
-
-pub struct Handle<T> {
-    core: Arc<Core>,
-    path: Vec<Link>,
-    item: T,
-}
-
-impl<T: Canonicalizable + Queriable + DeserializeOwned> Handle<T> {
-    pub async fn query<'a, U>(&self, name: &str, args: &[(&str, &str)]) -> anyhow::Result<Handle<U>>
-    where
-        U: DeserializeOwned,
-        U: Canonicalizable,
-        U: Queriable,
-    {
-        let mut body = Body {
-            query: U::QUERY.join(" "),
-        };
-
-        let path = [Link {
-            name: name.into(),
-            kind: Some(U::TYPE.into()),
-            args: args.iter().map(|&(k, v)| (k.into(), v.into())).collect(),
-        }];
-
-        for link in path.iter().rev().chain(self.path.iter().rev()) {
-            if let Some(kind) = link.kind.as_ref() {
-                body.query = format!("... on {} {{ {} }}", kind, body.query);
-            }
-
-            let mut args = Vec::new();
-            for (k, v) in link.args.iter() {
-                args.push(format!("{}: {}", k, v));
-            }
-
-            body.query = if args.is_empty() {
-                format!("{} {{ {} }}", &link.name, body.query)
-            } else {
-                format!("{}({}) {{ {} }}", &link.name, args.join(", "), body.query)
-            }
-        }
-
-        body.query = format!("query {{ {} }}", body.query);
-
-        let resp = self
-            .core
-            .http
-            .post(self.core.base.clone())
-            .headers(self.core.head.clone())
-            .json(&body)
-            .send()
-            .await?;
-
-        let code = resp.status();
-        if code != StatusCode::OK {
-            return Err(HttpError(code).into());
-        }
-
-        let mut root = resp.json::<Value>().await?;
-        if root.get("errors").is_some() {
-            return Err(GraphQlError(root).into());
-        }
-
-        let mut value = match root.get_mut("data") {
-            Some(v) => v,
-            None => return Err(GraphQlError(root).into()),
-        };
-
-        for link in self.path.iter().chain(path.iter()) {
-            value = match value.get_mut(&link.name) {
-                Some(v) => v,
-                None => return Err(GraphQlError(root).into()),
-            };
-        }
-
-        let item: U = from_value(value.take())?;
-        let path = item.canonicalize([&self.path[..], &path[..]].concat());
-
-        Ok(Handle {
-            core: self.core.clone(),
-            path,
-            item,
-        })
-    }
-}
-
-impl<T> std::ops::Deref for Handle<T> {
-    type Target = T;
-
-    fn deref(&self) -> &T {
-        &self.item
-    }
-}
-
-impl<T> AsRef<T> for Handle<T> {
-    fn as_ref(&self) -> &T {
-        &self.item
-    }
-}
-
-impl<T> std::borrow::Borrow<T> for Handle<T> {
-    fn borrow(&self) -> &T {
-        &self.item
-    }
-}
-
-impl<T: Queriable + Default> Handle<T> {
-    pub fn root(base: &str, headers: &[(&str, &str)]) -> anyhow::Result<Self> {
-        const PRODUCT: &str = env!("CARGO_PKG_NAME");
-        const VERSION: &str = env!("CARGO_PKG_VERSION");
-
-        let mut head = HeaderMap::new();
-        for (k, v) in headers {
-            head.insert::<HeaderName>(k.parse()?, v.parse()?);
-        }
-
-        if !head.contains_key(USER_AGENT) {
-            let ua = format!("{}/{}", PRODUCT, VERSION).parse().unwrap();
-            head.insert(USER_AGENT, ua);
-        }
-
-        let core = Arc::new(Core {
-            http: Client::new(),
-            base: base.parse()?,
-            head,
-        });
-
-        Ok(Self {
-            core,
-            path: vec![],
-            item: T::default(),
-        })
-    }
-}
+#[cfg(test)]
+mod base;
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use serde::Deserialize;
-    use serde_json::ser::to_string;
+mod tests;
 
-    pub trait Node {
-        fn id(&self) -> &String;
+pub mod shared;
+pub mod types;
+
+pub use proc_macro2::TokenStream;
+pub use quote::ToTokens;
+
+use proc_macro2::*;
+use quote::*;
+use serde::Deserialize;
+use string_morph::Morph;
+
+#[derive(Deserialize, Debug)]
+pub struct Document {
+    pub data: Data,
+}
+
+impl ToTokens for Document {
+    fn to_tokens(&self, tokens: &mut TokenStream) {
+        tokens.extend(quote! {
+            #![allow(unused_variables)]
+            use super::*;
+        });
+
+        self.data.to_tokens(tokens)
     }
+}
 
-    impl<T: Queriable + Node> Canonicalizable for T {
-        fn canonicalize(&self, _: Vec<Link>) -> Vec<Link> {
-            let val = to_string(self.id()).unwrap();
+#[derive(Deserialize, Debug)]
+pub struct Data {
+    #[serde(rename = "__schema")]
+    pub schema: Schema,
+}
 
-            vec![Link {
-                name: "node".into(),
-                kind: Some(T::TYPE.into()),
-                args: vec![("id".into(), val)],
-            }]
+impl ToTokens for Data {
+    fn to_tokens(&self, tokens: &mut TokenStream) {
+        self.schema.to_tokens(tokens)
+    }
+}
+
+#[derive(Deserialize, Debug)]
+pub struct Schema {
+    #[serde(rename = "queryType")]
+    pub query_type: Option<QueryType>,
+
+    #[serde(rename = "mutationType")]
+    pub mutation_type: Option<MutationType>,
+
+    #[serde(rename = "subscriptionType")]
+    pub subscription_type: Option<SubscriptionType>,
+
+    #[serde(default)]
+    pub types: Vec<types::full::Type>,
+
+    #[serde(default)]
+    pub directives: Vec<Directive>,
+}
+
+impl ToTokens for Schema {
+    fn to_tokens(&self, tokens: &mut TokenStream) {
+        for fulltype in &self.types {
+            fulltype.to_tokens(tokens);
         }
     }
+}
 
-    #[derive(Debug, Deserialize, Serialize, Default)]
-    pub struct Query {}
+#[derive(Deserialize, Debug)]
+pub struct QueryType {
+    pub name: String,
+}
 
-    impl Canonicalizable for Query {}
-    impl Queriable for Query {
-        const QUERY: &'static [&'static str] = &[];
-        const TYPE: &'static str = "Query";
-    }
+#[derive(Deserialize, Debug)]
+pub struct MutationType {
+    pub name: String,
+}
 
-    impl Handle<Query> {
-        pub async fn user(&self, login: &str) -> anyhow::Result<Handle<User>> {
-            let login = to_string(login)?;
-            self.query("user", &[("login", &login)]).await
-        }
-    }
+#[derive(Deserialize, Debug)]
+pub struct SubscriptionType {
+    pub name: String,
+}
 
-    #[derive(Debug, Deserialize, Serialize)]
-    pub struct User {
-        pub id: String,
-        pub login: String,
-    }
+#[derive(Deserialize, Debug)]
+pub struct Directive {
+    pub name: shared::ItemName,
 
-    impl Node for User {
-        fn id(&self) -> &String {
-            &self.id
-        }
-    }
+    pub description: shared::Documentation,
 
-    impl Queriable for User {
-        const QUERY: &'static [&'static str] = &["id", "login"];
-        const TYPE: &'static str = "User";
-    }
+    #[serde(default)]
+    pub locations: Vec<Location>,
 
-    impl Handle<User> {
-        #[doc = "The user's description of what they're currently doing."]
-        pub async fn status(&self) -> anyhow::Result<Handle<Option<UserStatus>>> {
-            self.query("status", &[]).await
-        }
-    }
+    #[serde(default)]
+    pub args: Vec<Input>,
+}
 
-    #[derive(Debug, Deserialize, Serialize)]
-    pub struct UserStatus {
-        #[serde(rename = "indicatesLimitedAvailability")]
-        pub indicates_limited_availability: bool,
-    }
+#[derive(Deserialize, Debug, PartialEq)]
+pub enum Location {
+    #[serde(rename = "FIELD")]
+    Field,
 
-    impl Canonicalizable for UserStatus {}
-    impl Queriable for UserStatus {
-        const QUERY: &'static [&'static str] = &["indicatesLimitedAvailability"];
-        const TYPE: &'static str = "UserStatus";
-    }
+    #[serde(rename = "FRAGMENT_SPREAD")]
+    FragmentSpread,
 
-    macro_rules! wait {
-        ($e:expr) => {
-            tokio_test::block_on($e)
-        };
-    }
+    #[serde(rename = "INLINE_FRAGMENT")]
+    InlineFragment,
 
-    fn root() -> Handle<Query> {
-        let token = std::env::var("GITHUB_TOKEN");
-        let token = token.expect("Missing `GITHUB_TOKEN` environment variable");
-        let token = format!("token {}", token);
+    #[serde(rename = "FIELD_DEFINITION")]
+    FieldDefinition,
 
-        let base = "https://api.github.com/graphql";
+    #[serde(rename = "ENUM_VALUE")]
+    EnumValue,
+}
 
-        Handle::<Query>::root(base, &[("Authorization", &token)]).unwrap()
-    }
+#[derive(Deserialize, Debug, PartialEq)]
+pub struct Field {
+    pub name: shared::ItemName,
 
-    #[test]
-    fn query() {
-        let query = root();
+    pub description: shared::Documentation,
 
-        let user = wait!(query.user("npmccallum")).unwrap();
-        eprintln!("{:?}", *user);
-    }
+    #[serde(flatten)]
+    pub deprecated: shared::Deprecated,
 
-    #[test]
-    fn nested() {
-        let query = root();
+    #[serde(default)]
+    pub args: Vec<Input>,
 
-        let user = wait!(query.user("npmccallum")).unwrap();
-        eprintln!("{:?}", *user);
+    #[serde(rename = "type")]
+    pub kind: types::nullable::Type,
+}
 
-        let status = wait!(user.status()).unwrap();
-        eprintln!("{:?}", *status);
+#[derive(Deserialize, Debug, PartialEq)]
+pub struct Input {
+    pub name: shared::ItemName,
+
+    pub description: shared::Documentation,
+
+    #[serde(rename = "type")]
+    pub kind: types::nullable::Type,
+
+    #[serde(rename = "defaultValue")]
+    pub default_value: Option<String>,
+}
+
+impl ToTokens for Input {
+    fn to_tokens(&self, tokens: &mut TokenStream) {
+        let mut typ = TokenStream::default();
+        self.kind.to_tokens(&mut typ);
+        let name = &self.name;
+
+        tokens.extend(quote! { #name: #typ })
     }
 }
